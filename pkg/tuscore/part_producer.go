@@ -20,21 +20,24 @@ type fileChunk struct {
 // partProducer converts the request body into a stream of staged parts, so the
 // reader and the uploads to the object store can overlap.
 type partProducer struct {
-	tmpDir string
-	files  chan fileChunk
-	err    error
-	r      io.Reader
+	tmpDir    string
+	useMemory bool
+	files     chan fileChunk
+	err       error
+	r         io.Reader
 }
 
-func newPartProducer(source io.Reader, backlog int64, tmpDir string) (*partProducer, <-chan fileChunk) {
+// newPartProducer stages parts either in memory (small parts, bounded by the
+// caller's backlog) or in temporary files.
+func newPartProducer(source io.Reader, backlog int64, tmpDir string, useMemory bool) (*partProducer, <-chan fileChunk) {
 	if backlog <= 0 {
 		backlog = 1
 	}
 	if os.Getenv("TUSCORE_TEMP_MEMORY") == "1" {
-		tmpDir = tempDirUseMemory
+		useMemory = true
 	}
 	fileChan := make(chan fileChunk, backlog)
-	return &partProducer{tmpDir: tmpDir, files: fileChan, r: source}, fileChan
+	return &partProducer{tmpDir: tmpDir, useMemory: useMemory, files: fileChan, r: source}, fileChan
 }
 
 // closeUnreadFiles drains the channel so no staged file descriptor leaks when
@@ -67,7 +70,7 @@ outer:
 }
 
 func (p *partProducer) nextPart(size int64) (fileChunk, bool, error) {
-	if p.tmpDir != tempDirUseMemory {
+	if !p.useMemory && p.tmpDir != tempDirUseMemory {
 		file, err := os.CreateTemp(p.tmpDir, "tus-part-")
 		if err != nil {
 			return fileChunk{}, false, err

@@ -29,6 +29,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/tus/tusd/v2/pkg/handler"
 )
@@ -42,6 +44,10 @@ const (
 	DefaultMaxObjectSize         int64 = 5 << 40
 	DefaultMaxBufferedParts      int64 = 20
 	DefaultConcurrentPartUploads       = 10
+	// DefaultMemoryPartLimit stages parts up to this size in memory and only
+	// spills larger parts to disk. The producer backlog is scaled down so one
+	// upload never buffers more than this amount.
+	DefaultMemoryPartLimit int64 = 16 << 20
 )
 
 // nonPrintableRegexp matches every character which is not valid in a header
@@ -69,6 +75,9 @@ type Store struct {
 	MaxMultipartParts int64
 	MaxObjectSize     int64
 	MaxBufferedParts  int64
+	// MemoryPartLimit stages parts up to this size in memory instead of writing
+	// them to disk. Zero disables the memory mode.
+	MemoryPartLimit int64
 	// TemporaryDirectory stages chunk data. Empty uses os.TempDir().
 	TemporaryDirectory string
 	Logger             Logger
@@ -76,6 +85,41 @@ type Store struct {
 	sem     chan struct{}
 	locks   map[string]*sync.Mutex
 	locksMu sync.Mutex
+	stats   storeStats
+}
+
+// storeStats holds the per-process counters exposed through StatsSnapshot.
+type storeStats struct {
+	metadataCount atomic.Int64
+	metadataMs    atomic.Int64
+	partCount     atomic.Int64
+	partMs        atomic.Int64
+	partInFlight  atomic.Int64
+	partPeak      atomic.Int64
+	stageBytes    atomic.Int64
+}
+
+func (s *storeStats) observePeak(current int64) {
+	for {
+		peak := s.partPeak.Load()
+		if current <= peak || s.partPeak.CompareAndSwap(peak, current) {
+			return
+		}
+	}
+}
+
+// StatsSnapshot reports lightweight counters for status endpoints: metadata
+// fetches, part uploads, their durations and the observed concurrency peak.
+func (s *Store) StatsSnapshot() map[string]int64 {
+	return map[string]int64{
+		"metadata_fetches":       s.stats.metadataCount.Load(),
+		"metadata_millis":        s.stats.metadataMs.Load(),
+		"part_uploads":           s.stats.partCount.Load(),
+		"part_upload_millis":     s.stats.partMs.Load(),
+		"part_uploads_in_flight": s.stats.partInFlight.Load(),
+		"part_upload_peak":       s.stats.partPeak.Load(),
+		"staged_bytes":           s.stats.stageBytes.Load(),
+	}
 }
 
 // New builds a store. prefix should end with "/" (normalised here).
@@ -93,6 +137,7 @@ func New(bucket Bucket, prefix string) *Store {
 		MaxMultipartParts: DefaultMaxMultipartParts,
 		MaxObjectSize:     DefaultMaxObjectSize,
 		MaxBufferedParts:  DefaultMaxBufferedParts,
+		MemoryPartLimit:   DefaultMemoryPartLimit,
 		locks:             make(map[string]*sync.Mutex),
 	}
 	store.SetConcurrentPartUploads(DefaultConcurrentPartUploads)
@@ -288,6 +333,12 @@ func (u *Upload) GetReader(ctx context.Context) (io.ReadCloser, error) {
 
 // fetchInfo loads .info, the parts and the tail size concurrently.
 func (u *Upload) fetchInfo(ctx context.Context) (info handler.FileInfo, parts []*Part, incompletePartSize int64, err error) {
+	begin := time.Now()
+	defer func() {
+		u.store.stats.metadataCount.Add(1)
+		u.store.stats.metadataMs.Add(time.Since(begin).Milliseconds())
+	}()
+
 	var (
 		wg                    sync.WaitGroup
 		infoErr               error
@@ -375,6 +426,9 @@ func (u *Upload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (i
 
 	bytesUploaded, err := u.uploadParts(ctx, offset, src)
 	bytesUploaded = max(bytesUploaded-incompletePartSize, 0)
+	if err == nil {
+		u.store.stats.stageBytes.Add(bytesUploaded)
+	}
 	if u.info != nil {
 		u.info.Offset += bytesUploaded
 	}
@@ -398,7 +452,14 @@ func (u *Upload) uploadParts(ctx context.Context, offset int64, src io.Reader) (
 	}
 
 	nextPartNum := int32(len(parts) + 1)
-	producer, fileChan := newPartProducer(src, store.MaxBufferedParts, store.temporaryDirectory())
+	backlog := store.MaxBufferedParts
+	useMemory := store.MemoryPartLimit > 0 && optimalPartSize <= store.MemoryPartLimit
+	if useMemory {
+		if limit := store.MemoryPartLimit / optimalPartSize; limit >= 1 && limit < backlog {
+			backlog = limit
+		}
+	}
+	producer, fileChan := newPartProducer(src, backlog, store.temporaryDirectory(), useMemory)
 
 	producerCtx, cancelProducer := context.WithCancel(ctx)
 	defer func() {
@@ -436,7 +497,12 @@ func (u *Upload) uploadParts(ctx context.Context, offset int64, src io.Reader) (
 			go func() {
 				defer wg.Done()
 				defer store.release()
+				begin := time.Now()
+				store.stats.observePeak(store.stats.partInFlight.Add(1))
 				etag, uploadErr := store.Bucket.UploadPart(ctx, u.key(), u.multipartID, part.Number, chunk.reader, part.Size)
+				store.stats.partInFlight.Add(-1)
+				store.stats.partCount.Add(1)
+				store.stats.partMs.Add(time.Since(begin).Milliseconds())
 				if uploadErr != nil {
 					setErr(uploadErr)
 				} else {
