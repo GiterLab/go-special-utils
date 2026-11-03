@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tus/tusd/v2/pkg/handler"
@@ -21,9 +22,10 @@ var (
 
 // fakeBucket is an in-memory multipart store used to exercise the tus logic.
 type fakeBucket struct {
-	objects map[string][]byte
-	uploads map[string]*fakeUpload
-	nextID  int
+	objects        map[string][]byte
+	uploads        map[string]*fakeUpload
+	nextID         int
+	listPartsCalls atomic.Int32
 }
 
 type fakeUpload struct {
@@ -63,6 +65,7 @@ func (b *fakeBucket) UploadPart(ctx context.Context, key, uploadID string, numbe
 
 func (b *fakeBucket) ListParts(ctx context.Context, key, uploadID string) ([]Part, error) {
 	_ = ctx
+	b.listPartsCalls.Add(1)
 	upload, ok := b.uploads[uploadID]
 	if !ok || upload.key != key {
 		return nil, errFakeNoSuchUpload
@@ -302,6 +305,44 @@ func TestTerminateRemovesCompanions(t *testing.T) {
 	}
 	if len(bucket.uploads) != 0 {
 		t.Fatalf("multipart uploads left: %d", len(bucket.uploads))
+	}
+}
+
+// tusd calls GetInfo before WriteChunk and again while finishing. All of that
+// happens on one upload handle, so the state must be fetched only once.
+func TestStateFetchedOncePerHandle(t *testing.T) {
+	ctx := context.Background()
+	store, bucket := newStore(t)
+	handle := upload(t, store, 12<<20)
+	if _, err := handle.WriteChunk(ctx, 0, bytes.NewReader(make([]byte, 7<<20))); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	if got := bucket.listPartsCalls.Load(); got != 0 {
+		t.Fatalf("the creating handle must not list parts, got %d", got)
+	}
+
+	info, err := handle.GetInfo(ctx)
+	if err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	reopened, err := store.GetUpload(ctx, info.ID)
+	if err != nil {
+		t.Fatalf("GetUpload: %v", err)
+	}
+	if _, err := reopened.GetInfo(ctx); err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if _, err := reopened.GetInfo(ctx); err != nil {
+		t.Fatalf("GetInfo: %v", err)
+	}
+	if _, err := reopened.WriteChunk(ctx, 7<<20, bytes.NewReader(make([]byte, 5<<20))); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	if err := reopened.FinishUpload(ctx); err != nil {
+		t.Fatalf("FinishUpload: %v", err)
+	}
+	if got := bucket.listPartsCalls.Load(); got != 1 {
+		t.Fatalf("ListParts calls = %d, want 1", got)
 	}
 }
 
