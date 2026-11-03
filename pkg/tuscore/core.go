@@ -1,7 +1,11 @@
 // Package tuscore implements a tusd DataStore on top of a small object-store
-// interface. Two providers (minio-go and aliyun-oss-go-sdk) implement Bucket,
-// so the tus semantics live in exactly one place and do not depend on the
-// upstream s3store or the AWS SDK.
+// interface (Bucket), so the tus semantics can run on minio-go and the Aliyun
+// OSS SDK without depending on the upstream s3store or the AWS SDK.
+//
+// The behaviour mirrors github.com/tus/tusd/v2/pkg/s3store, including the
+// request-scoped state cache, the on-disk part staging, concurrent part
+// uploads, concatenation, deferred length and content serving. Only the
+// transport (the Bucket implementation) differs.
 //
 // Layout (same as tusd, so existing records and the archive pipeline keep
 // working):
@@ -9,18 +13,6 @@
 //	<prefix><objectID>        content object (created on completion)
 //	<prefix><objectID>.info   upload metadata (JSON)
 //	<prefix><objectID>.part   incomplete tail (< MinPartSize)
-//
-// Two operational properties matter for long-running resumable uploads:
-//
-//   - the offset, the committed parts and the persisted tail are fetched once
-//     per upload handle and then cached, so one PATCH performs a single
-//     ListParts instead of re-listing for every snapshot;
-//   - chunk data is staged in a temporary file instead of a preallocated
-//     part-size (50 MiB) heap buffer, so memory usage follows the bytes that
-//     are actually in flight rather than the configured part size.
-//
-// The offset is still derived from the object store (parts plus the persisted
-// tail), never from the .info object alone.
 package tuscore
 
 import (
@@ -32,117 +24,147 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 
 	"github.com/tus/tusd/v2/pkg/handler"
 )
 
-// Defaults mirror the S3 multipart constraints; providers may reject smaller
-// parts for non-final chunks.
+// Defaults mirror the upstream s3store configuration.
 const (
-	DefaultMinPartSize   int64 = 5 << 20
-	DefaultPreferredSize int64 = 50 << 20
-	DefaultMaxParts            = 10000
-	readBufferSize             = 1 << 20
-	maxInfoObjectSize          = 1 << 20
+	DefaultMinPartSize           int64 = 5 << 20
+	DefaultPreferredPartSize     int64 = 50 << 20
+	DefaultMaxPartSize           int64 = 5 << 30
+	DefaultMaxMultipartParts     int64 = 10000
+	DefaultMaxObjectSize         int64 = 5 << 40
+	DefaultMaxBufferedParts      int64 = 20
+	DefaultConcurrentPartUploads       = 10
 )
 
-// Part is one committed multipart part.
-type Part struct {
-	Number int32
-	Size   int64
-	ETag   string
-}
+// nonPrintableRegexp matches every character which is not valid in a header
+// value according to RFC 2616. Upstream replaces them in object metadata.
+var nonPrintableRegexp = regexp.MustCompile(`[^\x09\x20-\x7E]`)
 
-// Bucket is the provider surface used by the store. Implementations must map
-// their SDK errors onto IsNotFound / IsNoSuchUpload.
-type Bucket interface {
-	NewMultipart(ctx context.Context, key, contentType string) (uploadID string, err error)
-	UploadPart(ctx context.Context, key, uploadID string, number int32, body io.Reader, size int64) (etag string, err error)
-	ListParts(ctx context.Context, key, uploadID string) ([]Part, error)
-	CompleteMultipart(ctx context.Context, key, uploadID string, parts []Part) error
-	AbortMultipart(ctx context.Context, key, uploadID string) error
+// errIncompleteUpload is used when a client attempts to download an upload
+// that has not been finished yet.
+var errIncompleteUpload = handler.NewError("ERR_INCOMPLETE_UPLOAD", "cannot stream non-finished upload", http.StatusBadRequest)
 
-	PutObject(ctx context.Context, key string, body io.Reader, size int64, contentType string) error
-	GetObject(ctx context.Context, key string) (io.ReadCloser, error)
-	// StatObject returns the object size; not-found errors are reported through
-	// IsNotFound.
-	StatObject(ctx context.Context, key string) (int64, error)
-	DeleteObject(ctx context.Context, key string) error
-
-	IsNotFound(err error) bool
-	IsNoSuchUpload(err error) bool
-}
-
-// Logger receives diagnostics; nil is fine.
-type Logger interface {
-	Debug(msg string, args ...any)
-	Warn(msg string, args ...any)
-}
-
-// Store implements handler.DataStore and handler.TerminaterDataStore.
+// Store implements handler.DataStore, handler.TerminaterDataStore,
+// handler.ConcaterDataStore, handler.LengthDeferrerDataStore and
+// handler.ContentServerDataStore.
 type Store struct {
-	Bucket            Bucket
-	Prefix            string
+	Bucket Bucket
+	// Prefix is prepended to the upload id (and to the .info/.part objects).
+	Prefix string
+	// MetadataPrefix is prepended to the .info/.part objects. Empty means
+	// Prefix.
+	MetadataPrefix string
+
 	MinPartSize       int64
 	PreferredPartSize int64
-	MaxParts          int
-	// TempDir stages chunk data on disk. Empty uses os.TempDir().
-	TempDir string
-	Logger  Logger
+	MaxPartSize       int64
+	MaxMultipartParts int64
+	MaxObjectSize     int64
+	MaxBufferedParts  int64
+	// TemporaryDirectory stages chunk data. Empty uses os.TempDir().
+	TemporaryDirectory string
+	Logger             Logger
 
-	uploadLocks   map[string]*sync.Mutex
-	uploadLocksMu sync.Mutex
+	sem     chan struct{}
+	locks   map[string]*sync.Mutex
+	locksMu sync.Mutex
 }
 
 // New builds a store. prefix should end with "/" (normalised here).
 func New(bucket Bucket, prefix string) *Store {
-	prefix = strings.Trim(prefix, "/")
+	prefix = strings.Trim(strings.TrimSpace(prefix), "/")
 	if prefix != "" {
 		prefix += "/"
 	}
-	return &Store{
+	store := &Store{
 		Bucket:            bucket,
 		Prefix:            prefix,
 		MinPartSize:       DefaultMinPartSize,
-		PreferredPartSize: DefaultPreferredSize,
-		MaxParts:          DefaultMaxParts,
-		uploadLocks:       make(map[string]*sync.Mutex),
+		PreferredPartSize: DefaultPreferredPartSize,
+		MaxPartSize:       DefaultMaxPartSize,
+		MaxMultipartParts: DefaultMaxMultipartParts,
+		MaxObjectSize:     DefaultMaxObjectSize,
+		MaxBufferedParts:  DefaultMaxBufferedParts,
+		locks:             make(map[string]*sync.Mutex),
 	}
+	store.SetConcurrentPartUploads(DefaultConcurrentPartUploads)
+	return store
 }
 
-// UseIn registers the store on a tusd composer.
+// SetConcurrentPartUploads limits how many parts are uploaded in parallel.
+func (s *Store) SetConcurrentPartUploads(limit int) {
+	if limit <= 0 {
+		limit = 1
+	}
+	s.sem = make(chan struct{}, limit)
+}
+
+func (s *Store) acquire() { s.sem <- struct{}{} }
+func (s *Store) release() { <-s.sem }
+
+// UseIn registers every extension the upstream s3store provides.
 func (s *Store) UseIn(composer *handler.StoreComposer) {
 	composer.UseCore(s)
 	composer.UseTerminater(s)
+	composer.UseConcater(s)
+	composer.UseLengthDeferrer(s)
+	composer.UseContentServer(s)
 }
 
-func (s *Store) key(objectID string) string     { return s.Prefix + objectID }
-func (s *Store) infoKey(objectID string) string { return s.key(objectID) + ".info" }
-func (s *Store) partKey(objectID string) string { return s.key(objectID) + ".part" }
+func (s *Store) AsTerminatableUpload(upload handler.Upload) handler.TerminatableUpload {
+	return upload.(*Upload)
+}
 
-func (s *Store) tempDir() string {
-	if dir := strings.TrimSpace(s.TempDir); dir != "" {
-		return dir
+func (s *Store) AsLengthDeclarableUpload(upload handler.Upload) handler.LengthDeclarableUpload {
+	return upload.(*Upload)
+}
+
+func (s *Store) AsConcatableUpload(upload handler.Upload) handler.ConcatableUpload {
+	return upload.(*Upload)
+}
+
+func (s *Store) AsServableUpload(upload handler.Upload) handler.ServableUpload {
+	return upload.(*Upload)
+}
+
+func (s *Store) key(objectID string) string { return s.Prefix + objectID }
+
+func (s *Store) metadataKey(objectID string) string {
+	prefix := strings.Trim(strings.TrimSpace(s.MetadataPrefix), "/")
+	if prefix == "" {
+		return s.key(objectID)
 	}
-	return os.TempDir()
+	return prefix + "/" + objectID
 }
+
+func (s *Store) infoKey(objectID string) string { return s.metadataKey(objectID) + ".info" }
+func (s *Store) partKey(objectID string) string { return s.metadataKey(objectID) + ".part" }
 
 func (s *Store) lockFor(objectID string) *sync.Mutex {
-	s.uploadLocksMu.Lock()
-	defer s.uploadLocksMu.Unlock()
-	lock, ok := s.uploadLocks[objectID]
+	s.locksMu.Lock()
+	defer s.locksMu.Unlock()
+	lock, ok := s.locks[objectID]
 	if !ok {
 		lock = &sync.Mutex{}
-		s.uploadLocks[objectID] = lock
+		s.locks[objectID] = lock
 	}
 	return lock
 }
 
 // NewUpload creates the multipart upload and the .info object.
 func (s *Store) NewUpload(ctx context.Context, info handler.FileInfo) (handler.Upload, error) {
+	if info.Size > s.MaxObjectSize {
+		return nil, fmt.Errorf("tuscore: upload size of %v bytes exceeds MaxObjectSize of %v bytes", info.Size, s.MaxObjectSize)
+	}
+
 	objectID := strings.TrimSpace(info.ID)
 	if objectID == "" {
 		generated, err := randomID()
@@ -151,401 +173,626 @@ func (s *Store) NewUpload(ctx context.Context, info handler.FileInfo) (handler.U
 		}
 		objectID = generated
 	}
-	key := s.key(objectID)
-	contentType := info.MetaData["filetype"]
-	uploadID, err := s.Bucket.NewMultipart(ctx, key, contentType)
+
+	metadata := make(map[string]string, len(info.MetaData))
+	for key, value := range info.MetaData {
+		metadata[key] = nonPrintableRegexp.ReplaceAllString(value, "?")
+	}
+
+	contentType := ""
+	if fileType, found := info.MetaData["filetype"]; found {
+		contentType = fileType
+	}
+	uploadID, err := s.Bucket.NewMultipart(ctx, s.key(objectID), contentType, metadata)
 	if err != nil {
-		return nil, fmt.Errorf("tuscore: create multipart: %w", err)
+		return nil, fmt.Errorf("tuscore: unable to create multipart upload: %w", err)
 	}
 
 	info.ID = objectID + "+" + uploadID
-	info.Offset = 0
-	info.Storage = map[string]string{"Type": "tuscore", "Key": key}
-	if err := s.writeInfo(ctx, objectID, info); err != nil {
-		_ = s.Bucket.AbortMultipart(ctx, key, uploadID)
-		return nil, fmt.Errorf("tuscore: write info: %w", err)
+	info.Storage = map[string]string{
+		"Type":   "tuscore",
+		"Bucket": s.Bucket.Name(),
+		"Key":    s.key(objectID),
 	}
-	return &Upload{
-		store:       s,
+	upload := &Upload{
 		objectID:    objectID,
 		multipartID: uploadID,
-		key:         key,
-		mu:          s.lockFor(objectID),
-		info:        info,
-		loaded:      true,
-	}, nil
+		store:       s,
+		parts:       []*Part{},
+	}
+	if err := upload.writeInfo(ctx, info); err != nil {
+		return nil, fmt.Errorf("tuscore: unable to create info file: %w", err)
+	}
+	return upload, nil
 }
 
-// GetUpload returns a lazy handle. The first GetInfo/WriteChunk/FinishUpload
-// call fetches the .info object, the parts and the tail size once.
+// GetUpload returns a lazy handle; nothing is fetched until it is needed.
 func (s *Store) GetUpload(ctx context.Context, id string) (handler.Upload, error) {
-	objectID, multipartID, ok := splitID(id)
+	objectID, multipartID, ok := splitIDs(id)
 	if !ok {
 		return nil, handler.ErrNotFound
 	}
 	return &Upload{
-		store:       s,
 		objectID:    objectID,
 		multipartID: multipartID,
-		key:         s.key(objectID),
-		mu:          s.lockFor(objectID),
+		store:       s,
+		parts:       []*Part{},
 	}, nil
 }
 
-// AsTerminatableUpload implements handler.TerminaterDataStore.
-func (s *Store) AsTerminatableUpload(upload handler.Upload) handler.TerminatableUpload {
-	return upload.(*Upload)
+// Upload is the per-upload handle. The info/parts/incompletePartSize fields are
+// the request-scoped cache, exactly like upstream s3store.
+type Upload struct {
+	objectID    string
+	multipartID string
+	store       *Store
+
+	info               *handler.FileInfo
+	parts              []*Part
+	incompletePartSize int64
+	cacheMu            sync.Mutex
 }
 
-func (s *Store) writeInfo(ctx context.Context, objectID string, info handler.FileInfo) error {
+func (u *Upload) key() string { return u.store.key(u.objectID) }
+
+func (u *Upload) writeInfo(ctx context.Context, info handler.FileInfo) error {
+	u.info = &info
 	data, err := json.Marshal(info)
 	if err != nil {
 		return err
 	}
-	return s.Bucket.PutObject(ctx, s.infoKey(objectID), bytes.NewReader(data), int64(len(data)), "application/json")
+	return u.store.Bucket.PutObject(ctx, u.store.infoKey(u.objectID), bytes.NewReader(data), int64(len(data)), "application/json")
 }
 
-// Upload is the per-upload handle. Everything below key is the per-request
-// cache; a new request always starts from GetUpload and reloads from storage.
-type Upload struct {
-	store       *Store
-	objectID    string
-	multipartID string
-	key         string
-	mu          *sync.Mutex
-
-	info      handler.FileInfo
-	parts     []Part
-	tailSize  int64
-	loaded    bool
-	completed bool
+func (u *Upload) getInternalInfo(ctx context.Context) (handler.FileInfo, []*Part, int64, error) {
+	if u.info != nil {
+		return *u.info, u.parts, u.incompletePartSize, nil
+	}
+	info, parts, incompletePartSize, err := u.fetchInfo(ctx)
+	if err != nil {
+		return info, parts, incompletePartSize, err
+	}
+	u.info = &info
+	u.parts = parts
+	u.incompletePartSize = incompletePartSize
+	return info, parts, incompletePartSize, nil
 }
 
-// WriteChunk streams src into parts, staging bytes on disk. Full parts are
-// uploaded as they fill up; the remainder is persisted as the .part object.
+// GetInfo reports the committed bytes plus the persisted tail.
+func (u *Upload) GetInfo(ctx context.Context) (handler.FileInfo, error) {
+	info, _, _, err := u.getInternalInfo(ctx)
+	return info, err
+}
+
+// GetReader opens the completed object.
+func (u *Upload) GetReader(ctx context.Context) (io.ReadCloser, error) {
+	object, err := u.store.Bucket.GetObject(ctx, u.key(), GetOptions{})
+	if err == nil {
+		return object.Body, nil
+	}
+	if !u.store.Bucket.IsNotFound(err) {
+		return nil, err
+	}
+
+	// The object is missing, but the multipart upload may still exist, which
+	// means the upload simply has not been finished yet.
+	_, _, _, listErr := u.store.Bucket.ListParts(ctx, u.key(), u.multipartID, 0)
+	if listErr == nil {
+		return nil, errIncompleteUpload
+	}
+	if u.store.Bucket.IsNoSuchUpload(listErr) || u.store.Bucket.IsNotFound(listErr) {
+		return nil, handler.ErrNotFound
+	}
+	return nil, listErr
+}
+
+// fetchInfo loads .info, the parts and the tail size concurrently.
+func (u *Upload) fetchInfo(ctx context.Context) (info handler.FileInfo, parts []*Part, incompletePartSize int64, err error) {
+	var (
+		wg                    sync.WaitGroup
+		infoErr               error
+		partsErr              error
+		incompletePartSizeErr error
+	)
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		object, getErr := u.store.Bucket.GetObject(ctx, u.store.infoKey(u.objectID), GetOptions{})
+		if getErr != nil {
+			infoErr = getErr
+			return
+		}
+		defer object.Body.Close()
+		infoErr = json.NewDecoder(io.LimitReader(object.Body, 1<<20)).Decode(&info)
+	}()
+	go func() {
+		defer wg.Done()
+		parts, partsErr = u.listAllParts(ctx, u.objectID, u.multipartID)
+	}()
+	go func() {
+		defer wg.Done()
+		incompletePartSize, incompletePartSizeErr = u.store.headIncompletePart(ctx, u.objectID)
+	}()
+	wg.Wait()
+
+	if infoErr != nil {
+		if u.store.Bucket.IsNotFound(infoErr) {
+			return info, nil, 0, handler.ErrNotFound
+		}
+		return info, nil, 0, infoErr
+	}
+	if partsErr != nil {
+		if u.store.Bucket.IsNoSuchUpload(partsErr) || u.store.Bucket.IsNotFound(partsErr) {
+			// The multipart upload is gone: it was either completed or aborted.
+			// Because the .info object exists we treat it as completed.
+			info.Offset = info.Size
+			return info, nil, 0, nil
+		}
+		return info, nil, 0, partsErr
+	}
+	if incompletePartSizeErr != nil {
+		return info, nil, 0, incompletePartSizeErr
+	}
+
+	offset := incompletePartSize
+	for _, part := range parts {
+		offset += part.Size
+	}
+	info.Offset = offset
+	return info, parts, incompletePartSize, nil
+}
+
+// WriteChunk streams src into parts, staging bytes on disk.
 func (u *Upload) WriteChunk(ctx context.Context, offset int64, src io.Reader) (int64, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-
-	info, err := u.load(ctx)
+	info, _, incompletePartSize, err := u.getInternalInfo(ctx)
 	if err != nil {
 		return 0, err
-	}
-	if u.completed {
-		return 0, fmt.Errorf("tuscore: upload %s is already completed", u.objectID)
 	}
 	if offset != info.Offset {
 		return 0, fmt.Errorf("tuscore: invalid offset %d, expected %d", offset, info.Offset)
 	}
 
-	staging, err := os.CreateTemp(u.store.tempDir(), "tus-chunk-")
+	if incompletePartSize > 0 {
+		partFile, err := u.store.downloadIncompletePart(ctx, u.objectID)
+		if err != nil {
+			return 0, err
+		}
+		if partFile == nil {
+			return 0, errors.New("tuscore: expected an incomplete part file but did not get any")
+		}
+		defer cleanUpTempFile(partFile)
+
+		if err := u.store.deleteIncompletePart(ctx, u.objectID); err != nil {
+			return 0, err
+		}
+		u.cacheMu.Lock()
+		u.incompletePartSize = 0
+		u.cacheMu.Unlock()
+
+		src = io.MultiReader(partFile, src)
+		offset -= incompletePartSize
+	}
+
+	bytesUploaded, err := u.uploadParts(ctx, offset, src)
+	bytesUploaded = max(bytesUploaded-incompletePartSize, 0)
+	if u.info != nil {
+		u.info.Offset += bytesUploaded
+	}
+	return bytesUploaded, err
+}
+
+// uploadParts converts the request body into parts, uploading them
+// concurrently and parking a sub-MinPartSize tail in the .part object.
+func (u *Upload) uploadParts(ctx context.Context, offset int64, src io.Reader) (int64, error) {
+	store := u.store
+	info, parts, _, err := u.getInternalInfo(ctx)
 	if err != nil {
 		return 0, err
 	}
+
+	size := info.Size
+	bytesUploaded := int64(0)
+	optimalPartSize, err := store.calcOptimalPartSize(size)
+	if err != nil {
+		return 0, err
+	}
+
+	nextPartNum := int32(len(parts) + 1)
+	producer, fileChan := newPartProducer(src, store.MaxBufferedParts, store.temporaryDirectory())
+
+	producerCtx, cancelProducer := context.WithCancel(ctx)
 	defer func() {
-		_ = staging.Close()
-		_ = os.Remove(staging.Name())
+		cancelProducer()
+		producer.closeUnreadFiles()
 	}()
+	go producer.produce(producerCtx, optimalPartSize)
 
-	tailKey := u.store.partKey(u.objectID)
-	var tailSize int64
-	if u.tailSize > 0 {
-		reader, err := u.store.Bucket.GetObject(ctx, tailKey)
-		if err != nil {
-			if !u.store.Bucket.IsNotFound(err) {
-				return 0, err
-			}
-		} else {
-			n, copyErr := io.Copy(staging, reader)
-			_ = reader.Close()
-			if copyErr != nil {
-				return 0, copyErr
-			}
-			tailSize = n
-			// The persisted tail is now local; removing it first keeps the
-			// offset from double counting if this request dies mid-write.
-			if err := u.store.Bucket.DeleteObject(ctx, tailKey); err != nil && !u.store.Bucket.IsNotFound(err) {
-				return 0, err
-			}
-			u.tailSize = 0
+	var (
+		wg       sync.WaitGroup
+		errMu    sync.Mutex
+		firstErr error
+	)
+	setErr := func(err error) {
+		errMu.Lock()
+		if firstErr == nil {
+			firstErr = err
 		}
+		errMu.Unlock()
 	}
 
-	written, err := u.streamChunks(ctx, staging, &tailSize, src)
-	if err != nil {
-		// Parts may have been committed before the failure; reload next time.
-		u.loaded = false
-		return written, err
-	}
-
-	if tailSize > 0 {
-		if err := u.store.Bucket.PutObject(ctx, tailKey, io.NewSectionReader(staging, 0, tailSize), tailSize, ""); err != nil {
-			u.loaded = false
-			return written, err
-		}
-	}
-	u.tailSize = tailSize
-	u.info.Offset += written
-	return written, nil
-}
-
-// streamChunks appends src to the staging file and commits every full part.
-func (u *Upload) streamChunks(ctx context.Context, staging *os.File, tailSize *int64, src io.Reader) (int64, error) {
-	partSize := u.store.partSize(u.info.Size)
-	buffer := make([]byte, readBufferSize)
-	var written int64
 	for {
-		n, readErr := src.Read(buffer)
-		if n > 0 {
-			if _, err := staging.WriteAt(buffer[:n], *tailSize); err != nil {
-				return written, err
-			}
-			*tailSize += int64(n)
-			written += int64(n)
-			for *tailSize >= partSize {
-				if err := u.commitPart(ctx, staging, partSize, tailSize); err != nil {
-					return written, err
+		store.acquire()
+		chunk, more := <-fileChan
+		if !more {
+			store.release()
+			break
+		}
+
+		isFinalChunk := !info.SizeIsDeferred && size == offset+bytesUploaded+chunk.size
+		if chunk.size >= store.MinPartSize || isFinalChunk {
+			part := &Part{Number: nextPartNum, Size: chunk.size}
+			u.parts = append(u.parts, part)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer store.release()
+				etag, uploadErr := store.Bucket.UploadPart(ctx, u.key(), u.multipartID, part.Number, chunk.reader, part.Size)
+				if uploadErr != nil {
+					setErr(uploadErr)
+				} else {
+					part.ETag = etag
 				}
-			}
+				if closeErr := chunk.close(); closeErr != nil && uploadErr == nil {
+					setErr(closeErr)
+				}
+			}()
+		} else {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				defer store.release()
+				putErr := store.putIncompletePart(ctx, u.objectID, chunk.reader, chunk.size)
+				if putErr != nil {
+					setErr(putErr)
+				} else {
+					u.cacheMu.Lock()
+					u.incompletePartSize = chunk.size
+					u.cacheMu.Unlock()
+				}
+				if closeErr := chunk.close(); closeErr != nil && putErr == nil {
+					setErr(closeErr)
+				}
+			}()
 		}
-		if readErr == io.EOF {
-			return written, nil
-		}
-		if readErr != nil {
-			return written, readErr
-		}
+
+		bytesUploaded += chunk.size
+		nextPartNum++
 	}
-}
 
-// commitPart uploads the leading partSize bytes of the staging file and shifts
-// whatever is left to the front. The remainder is bounded by readBufferSize,
-// so the shift never copies a full part.
-func (u *Upload) commitPart(ctx context.Context, staging *os.File, partSize int64, tailSize *int64) error {
-	number := int32(len(u.parts) + 1)
-	body := io.NewSectionReader(staging, 0, partSize)
-	etag, err := u.store.Bucket.UploadPart(ctx, u.key, u.multipartID, number, body, partSize)
-	if err != nil {
-		return fmt.Errorf("tuscore: upload part %d: %w", number, err)
+	wg.Wait()
+	if firstErr != nil {
+		return 0, firstErr
 	}
-	u.parts = append(u.parts, Part{Number: number, Size: partSize, ETag: etag})
-
-	remainder := *tailSize - partSize
-	if remainder > 0 {
-		source := io.NewSectionReader(staging, partSize, remainder)
-		if _, err := io.Copy(io.NewOffsetWriter(staging, 0), source); err != nil {
-			return err
-		}
-	}
-	*tailSize = remainder
-	return nil
+	return bytesUploaded, producer.err
 }
 
-// GetInfo reports the committed bytes plus the persisted tail.
-func (u *Upload) GetInfo(ctx context.Context) (handler.FileInfo, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.load(ctx)
-}
-
-// GetReader opens the completed object.
-func (u *Upload) GetReader(ctx context.Context) (io.ReadCloser, error) {
-	return u.store.Bucket.GetObject(ctx, u.key)
-}
-
-// FinishUpload promotes the tail to the last part and completes the upload.
+// FinishUpload promotes the tail to the last part and completes the upload,
+// following the upstream branch order.
 func (u *Upload) FinishUpload(ctx context.Context) error {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-
-	info, err := u.load(ctx)
+	store := u.store
+	info, parts, incompletePartSize, err := u.getInternalInfo(ctx)
 	if err != nil {
 		return err
 	}
-	tailKey := u.store.partKey(u.objectID)
-	if u.completed {
-		return u.finalizeInfo(ctx, info)
-	}
 
-	if u.tailSize > 0 {
-		staging, err := os.CreateTemp(u.store.tempDir(), "tus-finish-")
-		if err != nil {
-			return err
+	if incompletePartSize > 0 {
+		var partsSize int64
+		for _, part := range parts {
+			partsSize += part.Size
 		}
-		defer func() {
-			_ = staging.Close()
-			_ = os.Remove(staging.Name())
-		}()
-		reader, err := u.store.Bucket.GetObject(ctx, tailKey)
-		if err != nil {
-			if !u.store.Bucket.IsNotFound(err) {
+
+		switch {
+		case partsSize == info.Size:
+			// The parts already cover the declared size, so the leftover .part is
+			// stale (a completion retried after the part was promoted). Drop it.
+			if err := store.deleteIncompletePart(ctx, u.objectID); err != nil {
 				return err
 			}
-		} else {
-			n, copyErr := io.Copy(staging, reader)
-			_ = reader.Close()
-			if copyErr != nil {
-				return copyErr
+			u.incompletePartSize = 0
+		case partsSize+incompletePartSize == info.Size:
+			partFile, err := store.downloadIncompletePart(ctx, u.objectID)
+			if err != nil {
+				return err
 			}
-			if n > 0 {
-				number := int32(len(u.parts) + 1)
-				etag, err := u.store.Bucket.UploadPart(ctx, u.key, u.multipartID, number, io.NewSectionReader(staging, 0, n), n)
-				if err != nil {
-					return fmt.Errorf("tuscore: upload final part %d: %w", number, err)
-				}
-				u.parts = append(u.parts, Part{Number: number, Size: n, ETag: etag})
+			if partFile == nil {
+				return fmt.Errorf("tuscore: expected an incomplete part file for upload %s but did not get any", u.objectID)
 			}
-			u.tailSize = 0
+			defer cleanUpTempFile(partFile)
+
+			partNumber := int32(1)
+			if len(parts) > 0 {
+				partNumber = parts[len(parts)-1].Number + 1
+			}
+			etag, err := store.Bucket.UploadPart(ctx, u.key(), u.multipartID, partNumber, partFile, incompletePartSize)
+			if err != nil {
+				return err
+			}
+			parts = append(parts, &Part{Number: partNumber, Size: incompletePartSize, ETag: etag})
+			u.parts = parts
+
+			if err := store.deleteIncompletePart(ctx, u.objectID); err != nil {
+				return err
+			}
+			u.incompletePartSize = 0
+		default:
+			return fmt.Errorf("tuscore: cannot finish upload %s: multipart parts (%d bytes) plus incomplete part (%d bytes) do not match the declared size (%d bytes)",
+				u.objectID, partsSize, incompletePartSize, info.Size)
 		}
 	}
 
-	if len(u.parts) == 0 {
-		// Zero-byte upload: a multipart completion without parts is invalid.
-		_ = u.store.Bucket.AbortMultipart(ctx, u.key, u.multipartID)
-		if err := u.store.Bucket.PutObject(ctx, u.key, bytes.NewReader(nil), 0, info.MetaData["filetype"]); err != nil {
+	if len(parts) == 0 {
+		// S3 requires at least one part for a multipart completion.
+		etag, err := store.Bucket.UploadPart(ctx, u.key(), u.multipartID, 1, bytes.NewReader(nil), 0)
+		if err != nil {
 			return err
 		}
-	} else if err := u.store.Bucket.CompleteMultipart(ctx, u.key, u.multipartID, u.parts); err != nil {
+		parts = []*Part{{Number: 1, Size: 0, ETag: etag}}
+		u.parts = parts
+	}
+
+	completed := make([]Part, 0, len(parts))
+	for _, part := range parts {
+		completed = append(completed, *part)
+	}
+	if err := store.Bucket.CompleteMultipart(ctx, u.key(), u.multipartID, completed); err != nil {
 		return err
 	}
-	_ = u.store.Bucket.DeleteObject(ctx, tailKey)
-	return u.finalizeInfo(ctx, info)
+
+	// The object now exists; mark the upload as finished in the cached info and
+	// persist the final offset.
+	finished := info
+	finished.Offset = finished.Size
+	u.parts = parts
+	return u.writeInfo(ctx, finished)
 }
 
 // Terminate aborts the multipart upload and removes all companion objects.
 func (u *Upload) Terminate(ctx context.Context) error {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	if err := u.store.Bucket.AbortMultipart(ctx, u.key, u.multipartID); err != nil &&
-		!u.store.Bucket.IsNotFound(err) && !u.store.Bucket.IsNoSuchUpload(err) {
+	store := u.store
+	var wg sync.WaitGroup
+	errCh := make(chan error, 4)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := store.Bucket.AbortMultipart(ctx, u.key(), u.multipartID)
+		if err != nil && !store.Bucket.IsNoSuchUpload(err) && !store.Bucket.IsNotFound(err) {
+			errCh <- err
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for _, key := range []string{u.key(), store.partKey(u.objectID), store.infoKey(u.objectID)} {
+			if err := store.Bucket.DeleteObject(ctx, key); err != nil && !store.Bucket.IsNotFound(err) {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	errs := make([]error, 0, 4)
+	for err := range errCh {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
+}
+
+// DeclareLength implements handler.LengthDeclarableUpload.
+func (u *Upload) DeclareLength(ctx context.Context, length int64) error {
+	info, err := u.GetInfo(ctx)
+	if err != nil {
 		return err
 	}
-	for _, key := range []string{u.store.partKey(u.objectID), u.store.infoKey(u.objectID), u.key} {
-		if err := u.store.Bucket.DeleteObject(ctx, key); err != nil && !u.store.Bucket.IsNotFound(err) {
+	info.Size = length
+	info.SizeIsDeferred = false
+	return u.writeInfo(ctx, info)
+}
+
+// ConcatUploads implements handler.ConcatableUpload.
+func (u *Upload) ConcatUploads(ctx context.Context, partialUploads []handler.Upload) error {
+	store := u.store
+	hasSmallPart := false
+	sizes := make([]int64, len(partialUploads))
+	for index, partial := range partialUploads {
+		info, err := partial.GetInfo(ctx)
+		if err != nil {
 			return err
 		}
+		sizes[index] = info.Size
+		if info.Size < store.MinPartSize {
+			hasSmallPart = true
+		}
 	}
+	if hasSmallPart {
+		return u.concatUsingDownload(ctx, partialUploads)
+	}
+	return u.concatUsingMultipart(ctx, partialUploads, sizes)
+}
+
+func (u *Upload) concatUsingDownload(ctx context.Context, partialUploads []handler.Upload) error {
+	store := u.store
+	file, err := os.CreateTemp(store.temporaryDirectory(), "tus-concat-")
+	if err != nil {
+		return err
+	}
+	defer cleanUpTempFile(file)
+
+	for _, partial := range partialUploads {
+		source := partial.(*Upload)
+		object, err := store.Bucket.GetObject(ctx, source.key(), GetOptions{})
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(file, object.Body)
+		_ = object.Body.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if err := store.Bucket.PutObject(ctx, u.key(), file, stat.Size(), ""); err != nil {
+		return err
+	}
+
+	// The multipart upload is no longer used; abort it in the background like
+	// upstream does, ignoring the outcome.
+	go func() {
+		_ = store.Bucket.AbortMultipart(context.Background(), u.key(), u.multipartID)
+	}()
 	return nil
 }
 
-// load fetches .info, the parts and the tail size once per handle.
-func (u *Upload) load(ctx context.Context) (handler.FileInfo, error) {
-	if u.loaded {
-		return u.info, nil
-	}
+func (u *Upload) concatUsingMultipart(ctx context.Context, partialUploads []handler.Upload, sizes []int64) error {
+	store := u.store
+	u.parts = make([]*Part, len(partialUploads))
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(partialUploads))
 
-	var (
-		wg       sync.WaitGroup
-		info     handler.FileInfo
-		parts    []Part
-		tailSize int64
-		infoErr  error
-		partsErr error
-		tailErr  error
-	)
-	wg.Add(3)
-	go func() {
-		defer wg.Done()
-		info, infoErr = u.readInfo(ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		parts, partsErr = u.store.Bucket.ListParts(ctx, u.key, u.multipartID)
-	}()
-	go func() {
-		defer wg.Done()
-		tailSize, tailErr = u.store.Bucket.StatObject(ctx, u.store.partKey(u.objectID))
-	}()
-	wg.Wait()
-
-	if infoErr != nil {
-		return handler.FileInfo{}, infoErr
-	}
-	if partsErr != nil {
-		// The multipart session is gone: the upload either completed already
-		// or was aborted elsewhere. Fall back to the stored object length.
-		if u.store.Bucket.IsNoSuchUpload(partsErr) || u.store.Bucket.IsNotFound(partsErr) {
-			size, statErr := u.store.Bucket.StatObject(ctx, u.key)
-			if statErr != nil {
-				if u.store.Bucket.IsNotFound(statErr) {
-					return handler.FileInfo{}, handler.ErrNotFound
-				}
-				return handler.FileInfo{}, statErr
+	for index, partial := range partialUploads {
+		partNumber := int32(index + 1)
+		source := partial.(*Upload)
+		size := sizes[index]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			etag, err := store.Bucket.UploadPartCopy(ctx, u.key(), u.multipartID, partNumber, source.key(), size)
+			if err != nil {
+				errCh <- err
+				return
 			}
-			info.Offset = size
-			u.info, u.parts, u.tailSize = info, nil, 0
-			u.loaded, u.completed = true, true
-			return u.info, nil
-		}
-		return handler.FileInfo{}, partsErr
+			u.parts[partNumber-1] = &Part{Number: partNumber, Size: size, ETag: etag}
+		}()
 	}
-	if tailErr != nil {
-		if !u.store.Bucket.IsNotFound(tailErr) {
-			return handler.FileInfo{}, tailErr
-		}
-		tailSize = 0
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		return err
 	}
-
-	var offset int64
-	for _, part := range parts {
-		offset += part.Size
-	}
-	info.Offset = offset + tailSize
-	u.info, u.parts, u.tailSize = info, parts, tailSize
-	u.loaded = true
-	return u.info, nil
+	return u.FinishUpload(ctx)
 }
 
-func (u *Upload) readInfo(ctx context.Context) (handler.FileInfo, error) {
-	var info handler.FileInfo
-	reader, err := u.store.Bucket.GetObject(ctx, u.store.infoKey(u.objectID))
+// fetch helpers -------------------------------------------------------------
+
+func (u *Upload) listAllParts(ctx context.Context, objectID, multipartID string) ([]*Part, error) {
+	var parts []*Part
+	var marker int32
+	for {
+		page, truncated, next, err := u.store.Bucket.ListParts(ctx, u.store.key(objectID), multipartID, marker)
+		if err != nil {
+			return nil, err
+		}
+		for _, part := range page {
+			parts = append(parts, &Part{Number: part.Number, Size: part.Size, ETag: part.ETag})
+		}
+		if !truncated {
+			return parts, nil
+		}
+		marker = next
+	}
+}
+
+func (s *Store) headIncompletePart(ctx context.Context, objectID string) (int64, error) {
+	size, err := s.Bucket.HeadObject(ctx, s.partKey(objectID))
 	if err != nil {
-		if u.store.Bucket.IsNotFound(err) {
-			return info, handler.ErrNotFound
+		if s.Bucket.IsNotFound(err) {
+			return 0, nil
 		}
-		return info, err
+		return 0, err
 	}
-	defer reader.Close()
-	if err := json.NewDecoder(io.LimitReader(reader, maxInfoObjectSize)).Decode(&info); err != nil {
-		return info, fmt.Errorf("tuscore: decode info: %w", err)
-	}
-	if info.ID == "" {
-		info.ID = u.objectID + "+" + u.multipartID
-	}
-	return info, nil
+	return size, nil
 }
 
-func (u *Upload) finalizeInfo(ctx context.Context, info handler.FileInfo) error {
-	info.Offset = info.Size
-	u.info = info
-	u.parts = nil
-	u.tailSize = 0
-	u.completed = true
-	return u.store.writeInfo(ctx, u.objectID, info)
-}
-
-// partSize picks the multipart part size for one upload.
-func (s *Store) partSize(size int64) int64 {
-	minimum := s.MinPartSize
-	if minimum <= 0 {
-		minimum = DefaultMinPartSize
-	}
-	preferred := s.PreferredPartSize
-	if preferred < minimum {
-		preferred = minimum
-	}
-	maxParts := s.MaxParts
-	if maxParts <= 0 {
-		maxParts = DefaultMaxParts
-	}
-	if size > 0 {
-		if needed := (size + int64(maxParts) - 1) / int64(maxParts); needed > preferred {
-			preferred = needed
+func (s *Store) downloadIncompletePart(ctx context.Context, objectID string) (*os.File, error) {
+	object, err := s.Bucket.GetObject(ctx, s.partKey(objectID), GetOptions{})
+	if err != nil {
+		if s.Bucket.IsNotFound(err) {
+			return nil, nil
 		}
+		return nil, err
 	}
-	return preferred
+	defer object.Body.Close()
+
+	file, err := os.CreateTemp(s.temporaryDirectory(), "tus-tail-")
+	if err != nil {
+		return nil, err
+	}
+	n, err := io.Copy(file, object.Body)
+	if err != nil {
+		cleanUpTempFile(file)
+		return nil, err
+	}
+	if object.Size > 0 && n < object.Size {
+		cleanUpTempFile(file)
+		return nil, errors.New("tuscore: short read of incomplete upload")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		cleanUpTempFile(file)
+		return nil, err
+	}
+	return file, nil
 }
 
-func splitID(id string) (objectID, multipartID string, ok bool) {
+func (s *Store) putIncompletePart(ctx context.Context, objectID string, body io.Reader, size int64) error {
+	return s.Bucket.PutObject(ctx, s.partKey(objectID), body, size, "")
+}
+
+func (s *Store) deleteIncompletePart(ctx context.Context, objectID string) error {
+	return s.Bucket.DeleteObject(ctx, s.partKey(objectID))
+}
+
+func (s *Store) temporaryDirectory() string {
+	if dir := strings.TrimSpace(s.TemporaryDirectory); dir != "" {
+		return dir
+	}
+	return ""
+}
+
+// calcOptimalPartSize mirrors the upstream calculation.
+func (s *Store) calcOptimalPartSize(size int64) (int64, error) {
+	var optimal int64
+	switch {
+	case size <= s.PreferredPartSize:
+		optimal = s.PreferredPartSize
+	case size <= s.PreferredPartSize*s.MaxMultipartParts:
+		optimal = s.PreferredPartSize
+	case size%s.MaxMultipartParts == 0:
+		optimal = size / s.MaxMultipartParts
+	default:
+		optimal = size/s.MaxMultipartParts + 1
+	}
+	if optimal > s.MaxPartSize {
+		return optimal, fmt.Errorf("tuscore: to upload %v bytes optimalPartSize %v must exceed MaxPartSize %v", size, optimal, s.MaxPartSize)
+	}
+	return optimal, nil
+}
+
+func cleanUpTempFile(file *os.File) {
+	_ = file.Close()
+	_ = os.Remove(file.Name())
+}
+
+func splitIDs(id string) (objectID, multipartID string, ok bool) {
 	index := strings.LastIndex(id, "+")
 	if index <= 0 || index == len(id)-1 {
 		return "", "", false
@@ -560,6 +807,3 @@ func randomID() (string, error) {
 	}
 	return hex.EncodeToString(raw), nil
 }
-
-// ErrInvalidOffset is returned when the caller skips or rewinds.
-var ErrInvalidOffset = errors.New("tuscore: invalid offset")

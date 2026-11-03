@@ -3,7 +3,10 @@ package miniostore
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/minio/minio-go/v7"
@@ -46,8 +49,14 @@ type bucket struct {
 	name   string
 }
 
-func (b *bucket) NewMultipart(ctx context.Context, key, contentType string) (string, error) {
-	return b.core.NewMultipartUpload(ctx, b.name, key, minio.PutObjectOptions{ContentType: contentType})
+func (b *bucket) Name() string { return b.name }
+
+func (b *bucket) NewMultipart(ctx context.Context, key, contentType string, metadata map[string]string) (string, error) {
+	options := minio.PutObjectOptions{ContentType: contentType}
+	if len(metadata) > 0 {
+		options.UserMetadata = metadata
+	}
+	return b.core.NewMultipartUpload(ctx, b.name, key, options)
 }
 
 func (b *bucket) UploadPart(ctx context.Context, key, uploadID string, number int32, body io.Reader, size int64) (string, error) {
@@ -58,26 +67,31 @@ func (b *bucket) UploadPart(ctx context.Context, key, uploadID string, number in
 	return part.ETag, nil
 }
 
-func (b *bucket) ListParts(ctx context.Context, key, uploadID string) ([]tuscore.Part, error) {
-	var parts []tuscore.Part
-	marker := 0
-	for {
-		result, err := b.core.ListObjectParts(ctx, b.name, key, uploadID, marker, 1000)
-		if err != nil {
-			return nil, err
-		}
-		for _, part := range result.ObjectParts {
-			parts = append(parts, tuscore.Part{
-				Number: int32(part.PartNumber),
-				Size:   part.Size,
-				ETag:   part.ETag,
-			})
-		}
-		if !result.IsTruncated {
-			return parts, nil
-		}
-		marker = result.NextPartNumberMarker
+func (b *bucket) UploadPartCopy(ctx context.Context, key, uploadID string, number int32, sourceKey string, sourceSize int64) (string, error) {
+	part, err := b.core.CopyObjectPart(ctx, b.name, sourceKey, b.name, key, uploadID, int(number), 0, sourceSize, nil)
+	if err != nil {
+		return "", err
 	}
+	return part.ETag, nil
+}
+
+func (b *bucket) ListParts(ctx context.Context, key, uploadID string, marker int32) ([]tuscore.Part, bool, int32, error) {
+	result, err := b.core.ListObjectParts(ctx, b.name, key, uploadID, int(marker), 1000)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	parts := make([]tuscore.Part, 0, len(result.ObjectParts))
+	for _, part := range result.ObjectParts {
+		parts = append(parts, tuscore.Part{
+			Number: int32(part.PartNumber),
+			Size:   part.Size,
+			ETag:   part.ETag,
+		})
+	}
+	if !result.IsTruncated {
+		return parts, false, 0, nil
+	}
+	return parts, true, int32(result.NextPartNumberMarker), nil
 }
 
 func (b *bucket) CompleteMultipart(ctx context.Context, key, uploadID string, parts []tuscore.Part) error {
@@ -102,19 +116,72 @@ func (b *bucket) PutObject(ctx context.Context, key string, body io.Reader, size
 	return err
 }
 
-func (b *bucket) GetObject(ctx context.Context, key string) (io.ReadCloser, error) {
-	object, err := b.client.GetObject(ctx, b.name, key, minio.GetObjectOptions{})
+func (b *bucket) GetObject(ctx context.Context, key string, opts tuscore.GetOptions) (*tuscore.Object, error) {
+	options := minio.GetObjectOptions{}
+	if opts.IfMatch != "" {
+		options.Set("If-Match", opts.IfMatch)
+	}
+	if opts.IfNoneMatch != "" {
+		options.Set("If-None-Match", opts.IfNoneMatch)
+	}
+	if !opts.IfModifiedSince.IsZero() {
+		options.Set("If-Modified-Since", opts.IfModifiedSince.UTC().Format(http.TimeFormat))
+	}
+	if !opts.IfUnmodifiedSince.IsZero() {
+		options.Set("If-Unmodified-Since", opts.IfUnmodifiedSince.UTC().Format(http.TimeFormat))
+	}
+
+	// A ranged response reports the range length, so the full object size has
+	// to come from a HEAD when the caller needs Content-Range.
+	var head *minio.ObjectInfo
+	if opts.Range != "" {
+		info, err := b.client.StatObject(ctx, b.name, key, minio.StatObjectOptions{})
+		if err != nil {
+			return nil, err
+		}
+		head = &info
+		start, end, ok := parseRangeHeader(opts.Range, info.Size)
+		if !ok {
+			return nil, fmt.Errorf("miniostore: unsupported Range header %q", opts.Range)
+		}
+		if err := options.SetRange(start, end); err != nil {
+			return nil, err
+		}
+	}
+
+	object, err := b.client.GetObject(ctx, b.name, key, options)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := object.Stat(); err != nil {
+	info, err := object.Stat()
+	if err != nil {
 		_ = object.Close()
 		return nil, err
 	}
-	return object, nil
+	result := &tuscore.Object{
+		Body:         object,
+		Size:         info.Size,
+		ContentType:  info.ContentType,
+		ETag:         info.ETag,
+		LastModified: info.LastModified,
+		AcceptRanges: "bytes",
+	}
+	if head != nil {
+		result.Size = head.Size
+		if result.ContentType == "" {
+			result.ContentType = head.ContentType
+		}
+		if result.ETag == "" {
+			result.ETag = head.ETag
+		}
+		if result.LastModified.IsZero() {
+			result.LastModified = head.LastModified
+		}
+	}
+	return result, nil
 }
 
-func (b *bucket) StatObject(ctx context.Context, key string) (int64, error) {
+func (b *bucket) HeadObject(ctx context.Context, key string) (int64, error) {
 	info, err := b.client.StatObject(ctx, b.name, key, minio.StatObjectOptions{})
 	if err != nil {
 		return 0, err
@@ -137,6 +204,57 @@ func (b *bucket) IsNotFound(err error) bool {
 
 func (b *bucket) IsNoSuchUpload(err error) bool {
 	return minio.ToErrorResponse(err).Code == "NoSuchUpload"
+}
+
+func (b *bucket) StatusCode(err error) int {
+	return minio.ToErrorResponse(err).StatusCode
+}
+
+// parseRangeHeader converts a single-range header into the inclusive bounds
+// minio-go expects.
+func parseRangeHeader(header string, size int64) (start, end int64, ok bool) {
+	value := strings.TrimSpace(header)
+	if !strings.HasPrefix(value, "bytes=") || size <= 0 {
+		return 0, 0, false
+	}
+	spec := strings.TrimSpace(strings.TrimPrefix(value, "bytes="))
+	if strings.Contains(spec, ",") {
+		return 0, 0, false
+	}
+	first, last, found := strings.Cut(spec, "-")
+	if !found {
+		return 0, 0, false
+	}
+	switch {
+	case strings.TrimSpace(first) == "":
+		suffix, err := strconv.ParseInt(strings.TrimSpace(last), 10, 64)
+		if err != nil || suffix <= 0 {
+			return 0, 0, false
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return size - suffix, size - 1, true
+	case strings.TrimSpace(last) == "":
+		parsed, err := strconv.ParseInt(strings.TrimSpace(first), 10, 64)
+		if err != nil || parsed < 0 || parsed >= size {
+			return 0, 0, false
+		}
+		return parsed, size - 1, true
+	default:
+		parsedStart, err := strconv.ParseInt(strings.TrimSpace(first), 10, 64)
+		if err != nil || parsedStart < 0 || parsedStart >= size {
+			return 0, 0, false
+		}
+		parsedEnd, err := strconv.ParseInt(strings.TrimSpace(last), 10, 64)
+		if err != nil || parsedEnd < parsedStart {
+			return 0, 0, false
+		}
+		if parsedEnd >= size {
+			parsedEnd = size - 1
+		}
+		return parsedStart, parsedEnd, true
+	}
 }
 
 // stripScheme keeps minio-go happy when the endpoint comes from an ini value
