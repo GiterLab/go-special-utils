@@ -149,34 +149,46 @@ func (b *bucket) GetObject(ctx context.Context, key string, opts tuscore.GetOpti
 		conditions = append(conditions, oss.IfUnmodifiedSince(opts.IfUnmodifiedSince))
 	}
 
-	if opts.Range == "" && len(conditions) == 0 {
-		body, err := b.bucket.GetObject(key)
+	// The SDK reports 3xx responses (including 304) as plain errors without the
+	// status code, so conditional requests are evaluated from a HEAD first and
+	// the GET itself is sent without the conditional headers.
+	if len(conditions) > 0 {
+		headers, err := b.bucket.GetObjectMeta(key)
 		if err != nil {
 			return nil, err
 		}
-		return &tuscore.Object{Body: body, Size: -1}, nil
+		if status := evaluateConditions(opts, headers); status != 0 {
+			return nil, &tuscore.StatusError{Status: status}
+		}
 	}
 
-	headers, err := b.bucket.GetObjectDetailedMeta(key, conditions...)
-	if err != nil {
-		return nil, err
-	}
-	options := append([]oss.Option{}, conditions...)
+	options := []oss.Option{}
 	if opts.Range != "" {
 		options = append(options, oss.NormalizedRange(strings.TrimPrefix(opts.Range, "bytes=")))
 	}
-	body, err := b.bucket.GetObject(key, options...)
+
+	// DoGetObject exposes the response headers, unlike GetObject, so the ETag,
+	// content type and full size come back without an extra HEAD request.
+	result, err := b.bucket.DoGetObject(&oss.GetObjectRequest{ObjectKey: key}, options)
 	if err != nil {
 		return nil, err
 	}
+	headers := result.Response.Headers
 	size, _ := strconv.ParseInt(headers.Get("Content-Length"), 10, 64)
+	contentRange := headers.Get("Content-Range")
+	if index := strings.LastIndex(contentRange, "/"); index >= 0 {
+		if total, parseErr := strconv.ParseInt(strings.TrimSpace(contentRange[index+1:]), 10, 64); parseErr == nil {
+			size = total
+		}
+	}
 	return &tuscore.Object{
-		Body:         body,
+		Body:         result.Response,
 		Size:         size,
 		ContentType:  headers.Get("Content-Type"),
 		ETag:         headers.Get("ETag"),
 		LastModified: parseHTTPTime(headers.Get("Last-Modified")),
 		AcceptRanges: "bytes",
+		ContentRange: contentRange,
 	}, nil
 }
 
@@ -208,11 +220,50 @@ func (b *bucket) IsNoSuchUpload(err error) bool {
 }
 
 func (b *bucket) StatusCode(err error) int {
+	var statusError *tuscore.StatusError
+	if errors.As(err, &statusError) {
+		return statusError.Status
+	}
 	var serviceError oss.ServiceError
 	if errors.As(err, &serviceError) {
 		return serviceError.StatusCode
 	}
 	return 0
+}
+
+// evaluateConditions returns the HTTP status a conditional request should be
+// answered with, or 0 when the request may proceed.
+func evaluateConditions(opts tuscore.GetOptions, headers http.Header) int {
+	etag := strings.Trim(headers.Get("ETag"), `"`)
+	if opts.IfMatch != "" && !etagMatches(opts.IfMatch, etag) {
+		return http.StatusPreconditionFailed
+	}
+	if opts.IfNoneMatch != "" && etagMatches(opts.IfNoneMatch, etag) {
+		return http.StatusNotModified
+	}
+	lastModified := parseHTTPTime(headers.Get("Last-Modified"))
+	if !opts.IfUnmodifiedSince.IsZero() && !lastModified.IsZero() && lastModified.After(opts.IfUnmodifiedSince) {
+		return http.StatusPreconditionFailed
+	}
+	if !opts.IfModifiedSince.IsZero() && !lastModified.IsZero() && !lastModified.After(opts.IfModifiedSince) {
+		return http.StatusNotModified
+	}
+	return 0
+}
+
+func etagMatches(header, etag string) bool {
+	if etag == "" {
+		return false
+	}
+	if strings.TrimSpace(header) == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(header, ",") {
+		if strings.Trim(strings.TrimSpace(candidate), `"`) == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func serviceCode(err error) string {

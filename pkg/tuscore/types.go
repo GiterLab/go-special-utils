@@ -2,9 +2,19 @@ package tuscore
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"time"
 )
+
+// StatusError reports a provider HTTP status without a response body. Some
+// SDKs return plain errors for 3xx responses, so providers use this type to
+// keep the status observable by the store.
+type StatusError struct{ Status int }
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("tuscore: provider returned status %d", e.Status)
+}
 
 // Part is one committed multipart part.
 type Part struct {

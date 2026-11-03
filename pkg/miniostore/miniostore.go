@@ -117,30 +117,41 @@ func (b *bucket) PutObject(ctx context.Context, key string, body io.Reader, size
 }
 
 func (b *bucket) GetObject(ctx context.Context, key string, opts tuscore.GetOptions) (*tuscore.Object, error) {
-	options := minio.GetObjectOptions{}
-	if opts.IfMatch != "" {
-		options.Set("If-Match", opts.IfMatch)
+	applyConditionals := func(target *minio.GetObjectOptions) {
+		if opts.IfMatch != "" {
+			target.Set("If-Match", opts.IfMatch)
+		}
+		if opts.IfNoneMatch != "" {
+			target.Set("If-None-Match", opts.IfNoneMatch)
+		}
+		if !opts.IfModifiedSince.IsZero() {
+			target.Set("If-Modified-Since", opts.IfModifiedSince.UTC().Format(http.TimeFormat))
+		}
+		if !opts.IfUnmodifiedSince.IsZero() {
+			target.Set("If-Unmodified-Since", opts.IfUnmodifiedSince.UTC().Format(http.TimeFormat))
+		}
 	}
-	if opts.IfNoneMatch != "" {
-		options.Set("If-None-Match", opts.IfNoneMatch)
-	}
-	if !opts.IfModifiedSince.IsZero() {
-		options.Set("If-Modified-Since", opts.IfModifiedSince.UTC().Format(http.TimeFormat))
-	}
-	if !opts.IfUnmodifiedSince.IsZero() {
-		options.Set("If-Unmodified-Since", opts.IfUnmodifiedSince.UTC().Format(http.TimeFormat))
-	}
+	conditional := opts.IfMatch != "" || opts.IfNoneMatch != "" ||
+		!opts.IfModifiedSince.IsZero() || !opts.IfUnmodifiedSince.IsZero()
 
-	// A ranged response reports the range length, so the full object size has
-	// to come from a HEAD when the caller needs Content-Range.
+	options := minio.GetObjectOptions{}
+	applyConditionals(&options)
+
+	// A ranged or conditional request is validated with a HEAD first: minio-go
+	// drops the Range header when an Object is stat'ed, and a 304/412 must
+	// surface as an error before any body is streamed.
 	var head *minio.ObjectInfo
-	if opts.Range != "" {
-		info, err := b.client.StatObject(ctx, b.name, key, minio.StatObjectOptions{})
+	if opts.Range != "" || conditional {
+		statOptions := minio.StatObjectOptions{}
+		applyConditionals(&statOptions)
+		info, err := b.client.StatObject(ctx, b.name, key, statOptions)
 		if err != nil {
 			return nil, err
 		}
 		head = &info
-		start, end, ok := parseRangeHeader(opts.Range, info.Size)
+	}
+	if opts.Range != "" {
+		start, end, ok := parseRangeHeader(opts.Range, head.Size)
 		if !ok {
 			return nil, fmt.Errorf("miniostore: unsupported Range header %q", opts.Range)
 		}
@@ -153,32 +164,32 @@ func (b *bucket) GetObject(ctx context.Context, key string, opts tuscore.GetOpti
 	if err != nil {
 		return nil, err
 	}
+	if head != nil {
+		// Do not Stat the object here: that would strip the Range header and the
+		// following read would fetch the whole object.
+		return &tuscore.Object{
+			Body:         object,
+			Size:         head.Size,
+			ContentType:  head.ContentType,
+			ETag:         head.ETag,
+			LastModified: head.LastModified,
+			AcceptRanges: "bytes",
+		}, nil
+	}
+
 	info, err := object.Stat()
 	if err != nil {
 		_ = object.Close()
 		return nil, err
 	}
-	result := &tuscore.Object{
+	return &tuscore.Object{
 		Body:         object,
 		Size:         info.Size,
 		ContentType:  info.ContentType,
 		ETag:         info.ETag,
 		LastModified: info.LastModified,
 		AcceptRanges: "bytes",
-	}
-	if head != nil {
-		result.Size = head.Size
-		if result.ContentType == "" {
-			result.ContentType = head.ContentType
-		}
-		if result.ETag == "" {
-			result.ETag = head.ETag
-		}
-		if result.LastModified.IsZero() {
-			result.LastModified = head.LastModified
-		}
-	}
-	return result, nil
+	}, nil
 }
 
 func (b *bucket) HeadObject(ctx context.Context, key string) (int64, error) {

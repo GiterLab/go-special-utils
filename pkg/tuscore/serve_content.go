@@ -2,6 +2,7 @@ package tuscore
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -32,7 +33,12 @@ func (u *Upload) ServeContent(ctx context.Context, w http.ResponseWriter, r *htt
 	if err != nil {
 		w.Header().Del("Content-Type")
 		w.Header().Del("Content-Disposition")
-		switch u.store.Bucket.StatusCode(err) {
+		status := u.store.Bucket.StatusCode(err)
+		var typed *StatusError
+		if errors.As(err, &typed) {
+			status = typed.Status
+		}
+		switch status {
 		case http.StatusNotFound, http.StatusForbidden:
 			// The object is missing, so the upload has not been finished yet.
 			return errIncompleteUpload
@@ -57,7 +63,14 @@ func (u *Upload) ServeContent(ctx context.Context, w http.ResponseWriter, r *htt
 	setHeader(w, "Content-Language", object.ContentLanguage)
 	setHeader(w, "Content-Type", object.ContentType)
 	setHeader(w, "Cache-Control", object.CacheControl)
-	setHeader(w, "ETag", object.ETag)
+	if object.ETag != "" {
+		// HTTP requires a quoted entity tag; minio-go reports it unquoted.
+		etag := object.ETag
+		if !strings.HasPrefix(etag, `"`) {
+			etag = `"` + etag + `"`
+		}
+		w.Header().Set("ETag", etag)
+	}
 	setHeader(w, "Expires", object.Expires)
 	if !object.LastModified.IsZero() {
 		w.Header().Set("Last-Modified", object.LastModified.Format(http.TimeFormat))
